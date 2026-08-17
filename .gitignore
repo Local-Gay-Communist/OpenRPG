@@ -1,0 +1,3 @@
+*.tgz
+deps/glew-*/
+deps/glfw-*/
