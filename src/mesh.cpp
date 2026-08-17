@@ -8,6 +8,8 @@
 #include <set>
 #include <cstdio>
 #include <fstream>
+#include <map>
+#include <set>
 
 // ---- Topology-modifying functions clear edge/face selections ----
 
@@ -404,4 +406,108 @@ void export_obj(const std::string& filename) {
     }
     file.close();
     printf("Exported OBJ to %s\n", filename.c_str());
+}
+
+void extrude_selected() {
+    if (g_selected_faces.empty()) return;
+    
+    // ---- 1. Collect unique vertices from selected faces ----
+    std::set<int> vert_set;
+    for (int tri : g_selected_faces) {
+        vert_set.insert(g_indices[tri*3]);
+        vert_set.insert(g_indices[tri*3+1]);
+        vert_set.insert(g_indices[tri*3+2]);
+    }
+    if (vert_set.empty()) return;
+    
+    // ---- 2. Compute average normal of selected faces ----
+    float avg_nx = 0, avg_ny = 0, avg_nz = 0;
+    for (int tri : g_selected_faces) {
+        int a = g_indices[tri*3], b = g_indices[tri*3+1], c = g_indices[tri*3+2];
+        float ax = g_vertices[a*3], ay = g_vertices[a*3+1], az = g_vertices[a*3+2];
+        float bx = g_vertices[b*3], by = g_vertices[b*3+1], bz = g_vertices[b*3+2];
+        float cx = g_vertices[c*3], cy = g_vertices[c*3+1], cz = g_vertices[c*3+2];
+        float ex1 = bx-ax, ey1 = by-ay, ez1 = bz-az;
+        float ex2 = cx-ax, ey2 = cy-ay, ez2 = cz-az;
+        float nx = ey1*ez2 - ez1*ey2;
+        float ny = ez1*ex2 - ex1*ez2;
+        float nz = ex1*ey2 - ey1*ex2;
+        float len = sqrtf(nx*nx + ny*ny + nz*nz);
+        if (len > 0.0001f) {
+            avg_nx += nx / len;
+            avg_ny += ny / len;
+            avg_nz += nz / len;
+        }
+    }
+    float alen = sqrtf(avg_nx*avg_nx + avg_ny*avg_ny + avg_nz*avg_nz);
+    if (alen > 0.0001f) {
+        avg_nx /= alen; avg_ny /= alen; avg_nz /= alen;
+    } else {
+        avg_nz = 1.0f; // fallback
+    }
+    
+    float offset = 0.5f; // extrusion distance (could be made configurable later)
+    
+    // ---- 3. Duplicate vertices and map old->new ----
+    std::map<int, int> remap;
+    for (int old_idx : vert_set) {
+        float new_x = g_vertices[old_idx*3] + avg_nx * offset;
+        float new_y = g_vertices[old_idx*3+1] + avg_ny * offset;
+        float new_z = g_vertices[old_idx*3+2] + avg_nz * offset;
+        int new_idx = (int)g_vertices.size() / 3;
+        g_vertices.push_back(new_x);
+        g_vertices.push_back(new_y);
+        g_vertices.push_back(new_z);
+        g_normals.push_back(0.0f);
+        g_normals.push_back(0.0f);
+        g_normals.push_back(1.0f); // placeholder, will be recomputed
+        remap[old_idx] = new_idx;
+    }
+    
+    // ---- 4. Build edge count map (to detect boundaries) ----
+    std::map<std::pair<int,int>, int> edge_count;
+    for (int tri : g_selected_faces) {
+        int v[3] = {g_indices[tri*3], g_indices[tri*3+1], g_indices[tri*3+2]};
+        for (int i = 0; i < 3; i++) {
+            int a = v[i], b = v[(i+1)%3];
+            if (a > b) std::swap(a, b);
+            edge_count[{a, b}]++;
+        }
+    }
+    
+    // ---- 5. For each selected face, create extruded face and side quads ----
+    for (int tri : g_selected_faces) {
+        int v[3] = {g_indices[tri*3], g_indices[tri*3+1], g_indices[tri*3+2]};
+        int new_v[3] = {remap[v[0]], remap[v[1]], remap[v[2]]};
+        
+        // Extruded face (new triangle)
+        g_indices.push_back(new_v[0]);
+        g_indices.push_back(new_v[1]);
+        g_indices.push_back(new_v[2]);
+        
+        // Side quads for boundary edges
+        for (int i = 0; i < 3; i++) {
+            int a = v[i], b = v[(i+1)%3];
+            int a_orig = a, b_orig = b;
+            if (a_orig > b_orig) std::swap(a_orig, b_orig);
+            if (edge_count[{a_orig, b_orig}] == 1) {
+                // Boundary edge: create quad (a, b, nb, na)
+                int na = remap[a];
+                int nb = remap[b];
+                g_indices.push_back(a);
+                g_indices.push_back(b);
+                g_indices.push_back(nb);
+                g_indices.push_back(a);
+                g_indices.push_back(nb);
+                g_indices.push_back(na);
+            }
+        }
+    }
+    
+    // ---- 6. Clean up selection and refresh ----
+    g_selected_faces.clear();
+    g_selected_edges.clear(); // just in case
+    g_selected.clear();
+    update_mesh_buffers();
+    update_gizmo_selection();
 }

@@ -20,3 +20,5 @@ void detriangulate_selected();
 void save_project_binary(const std::string& filename);
 void load_project_binary(const std::string& filename);
 void export_obj(const std::string& filename);
+
+void extrude_selected();
