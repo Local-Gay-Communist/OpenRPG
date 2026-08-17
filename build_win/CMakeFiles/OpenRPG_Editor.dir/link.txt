@@ -1,0 +1,3 @@
+/usr/bin/cmake -E rm -f CMakeFiles/OpenRPG_Editor.dir/objects.a
+/usr/bin/x86_64-w64-mingw32-ar qc CMakeFiles/OpenRPG_Editor.dir/objects.a @CMakeFiles/OpenRPG_Editor.dir/objects1.rsp
+/usr/bin/x86_64-w64-mingw32-g++  -include cmath -include algorithm -fpermissive -static -Wl,--whole-archive CMakeFiles/OpenRPG_Editor.dir/objects.a -Wl,--no-whole-archive -o bin/OpenRPG_Editor.exe -Wl,--out-implib,libOpenRPG_Editor.dll.a -Wl,--major-image-version,0,--minor-image-version,0 @CMakeFiles/OpenRPG_Editor.dir/linkLibs.rsp
