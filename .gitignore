@@ -1,3 +1,7 @@
 *.tgz
 deps/glew-*/
 deps/glfw-*/
+build_linux/*
+build_win/*
+imgui.ini
+OpenRPG_Editor
