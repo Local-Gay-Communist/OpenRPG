@@ -10,6 +10,7 @@
 #include <fstream>
 #include <map>
 #include <set>
+#include "viewport.h"
 
 // ---- Topology-modifying functions clear edge/face selections ----
 
@@ -410,20 +411,14 @@ void export_obj(const std::string& filename) {
 
 void extrude_selected() {
     if (g_selected_faces.empty()) return;
+
+    // ---- 1. Collect selected face indices ----
+    std::vector<int> selected_faces = g_selected_faces;
     
-    // ---- 1. Collect unique vertices from selected faces ----
-    std::set<int> vert_set;
-    for (int tri : g_selected_faces) {
-        vert_set.insert(g_indices[tri*3]);
-        vert_set.insert(g_indices[tri*3+1]);
-        vert_set.insert(g_indices[tri*3+2]);
-    }
-    if (vert_set.empty()) return;
-    
-    // ---- 2. Compute average normal of selected faces ----
+    // ---- 2. Compute average normal ----
     float avg_nx = 0, avg_ny = 0, avg_nz = 0;
-    for (int tri : g_selected_faces) {
-        int a = g_indices[tri*3], b = g_indices[tri*3+1], c = g_indices[tri*3+2];
+    for (int tri : selected_faces) {
+        int a = (int)g_indices[tri*3], b = (int)g_indices[tri*3+1], c = (int)g_indices[tri*3+2];
         float ax = g_vertices[a*3], ay = g_vertices[a*3+1], az = g_vertices[a*3+2];
         float bx = g_vertices[b*3], by = g_vertices[b*3+1], bz = g_vertices[b*3+2];
         float cx = g_vertices[c*3], cy = g_vertices[c*3+1], cz = g_vertices[c*3+2];
@@ -433,81 +428,142 @@ void extrude_selected() {
         float ny = ez1*ex2 - ex1*ez2;
         float nz = ex1*ey2 - ey1*ex2;
         float len = sqrtf(nx*nx + ny*ny + nz*nz);
-        if (len > 0.0001f) {
-            avg_nx += nx / len;
-            avg_ny += ny / len;
-            avg_nz += nz / len;
-        }
+        if (len > 0.0001f) { avg_nx += nx/len; avg_ny += ny/len; avg_nz += nz/len; }
     }
     float alen = sqrtf(avg_nx*avg_nx + avg_ny*avg_ny + avg_nz*avg_nz);
-    if (alen > 0.0001f) {
-        avg_nx /= alen; avg_ny /= alen; avg_nz /= alen;
-    } else {
-        avg_nz = 1.0f; // fallback
-    }
-    
-    float offset = 0.5f; // extrusion distance (could be made configurable later)
-    
-    // ---- 3. Duplicate vertices and map old->new ----
-    std::map<int, int> remap;
-    for (int old_idx : vert_set) {
-        float new_x = g_vertices[old_idx*3] + avg_nx * offset;
-        float new_y = g_vertices[old_idx*3+1] + avg_ny * offset;
-        float new_z = g_vertices[old_idx*3+2] + avg_nz * offset;
-        int new_idx = (int)g_vertices.size() / 3;
-        g_vertices.push_back(new_x);
-        g_vertices.push_back(new_y);
-        g_vertices.push_back(new_z);
-        g_normals.push_back(0.0f);
-        g_normals.push_back(0.0f);
-        g_normals.push_back(1.0f); // placeholder, will be recomputed
-        remap[old_idx] = new_idx;
-    }
-    
-    // ---- 4. Build edge count map (to detect boundaries) ----
+    if (alen > 0.0001f) { avg_nx /= alen; avg_ny /= alen; avg_nz /= alen; }
+    else { avg_nz = 1.0f; }
+
+    float offset = 0.5f;
+
+    // ---- 3. Build a map from old vertex index to new vertex index (for each use) ----
+    // We'll duplicate vertices for each triangle to get flat shading.
+    // First, create a copy of the original mesh data.
+    std::vector<float> old_vertices = g_vertices;
+    std::vector<unsigned int> old_indices = g_indices;
+
+    // We will append new triangles to the mesh.
+    // For each selected face, we need to add:
+    //   - a new cap triangle (using new vertices)
+    //   - side triangles for each boundary edge (using original and new vertices)
+
+    // But to get flat shading, each new triangle must have its own vertices.
+    // So we'll create vertices per triangle.
+
+    // We'll collect all the new vertices in a temporary list, and then append them.
+    // We'll also need to keep track of which original edge corresponds to which new edge.
+
+    // For simplicity, we'll just create vertices for each triangle as we go.
+
+    // --- Build edge boundary map ---
     std::map<std::pair<int,int>, int> edge_count;
-    for (int tri : g_selected_faces) {
-        int v[3] = {g_indices[tri*3], g_indices[tri*3+1], g_indices[tri*3+2]};
+    for (int tri : selected_faces) {
+        int v0 = (int)old_indices[tri*3], v1 = (int)old_indices[tri*3+1], v2 = (int)old_indices[tri*3+2];
+        int v[3] = {v0, v1, v2};
         for (int i = 0; i < 3; i++) {
             int a = v[i], b = v[(i+1)%3];
             if (a > b) std::swap(a, b);
             edge_count[{a, b}]++;
         }
     }
-    
-    // ---- 5. For each selected face, create extruded face and side quads ----
-    for (int tri : g_selected_faces) {
-        int v[3] = {g_indices[tri*3], g_indices[tri*3+1], g_indices[tri*3+2]};
-        int new_v[3] = {remap[v[0]], remap[v[1]], remap[v[2]]};
-        
-        // Extruded face (new triangle)
-        g_indices.push_back(new_v[0]);
-        g_indices.push_back(new_v[1]);
-        g_indices.push_back(new_v[2]);
-        
-        // Side quads for boundary edges
+
+    // For each selected face, create new geometry
+    for (int tri : selected_faces) {
+        int v0 = (int)old_indices[tri*3], v1 = (int)old_indices[tri*3+1], v2 = (int)old_indices[tri*3+2];
+        int v[3] = {v0, v1, v2};
+
+        // ---- Cap triangle (new extruded face) ----
+        // Create 3 new vertices for the cap
+        int new_idx[3];
+        for (int i = 0; i < 3; i++) {
+            float new_x = old_vertices[v[i]*3] + avg_nx * offset;
+            float new_y = old_vertices[v[i]*3+1] + avg_ny * offset;
+            float new_z = old_vertices[v[i]*3+2] + avg_nz * offset;
+            new_idx[i] = (int)g_vertices.size() / 3;
+            g_vertices.push_back(new_x);
+            g_vertices.push_back(new_y);
+            g_vertices.push_back(new_z);
+            g_normals.push_back(0.0f);
+            g_normals.push_back(0.0f);
+            g_normals.push_back(1.0f);
+        }
+        // Add cap triangle (order same as original to maintain outward normal)
+        g_indices.push_back((unsigned int)new_idx[0]);
+        g_indices.push_back((unsigned int)new_idx[1]);
+        g_indices.push_back((unsigned int)new_idx[2]);
+
+        // ---- Side quads for each edge ----
         for (int i = 0; i < 3; i++) {
             int a = v[i], b = v[(i+1)%3];
             int a_orig = a, b_orig = b;
             if (a_orig > b_orig) std::swap(a_orig, b_orig);
-            if (edge_count[{a_orig, b_orig}] == 1) {
-                // Boundary edge: create quad (a, b, nb, na)
-                int na = remap[a];
-                int nb = remap[b];
-                g_indices.push_back(a);
-                g_indices.push_back(b);
-                g_indices.push_back(nb);
-                g_indices.push_back(a);
-                g_indices.push_back(nb);
-                g_indices.push_back(na);
+            if (edge_count[{a_orig, b_orig}] == 1) { // boundary edge
+                // Create 4 new vertices: two from original edge, two from new edge
+                // We want flat shading, so each side triangle gets its own vertices.
+                // For quad (a, b, nb, na) we split into two triangles: (a,b,nb) and (a,nb,na)
+                // We'll create vertices for each triangle separately.
+
+                // Triangle 1: (a, b, nb)
+                int p0 = (int)g_vertices.size() / 3;
+                g_vertices.push_back(old_vertices[a*3]);
+                g_vertices.push_back(old_vertices[a*3+1]);
+                g_vertices.push_back(old_vertices[a*3+2]);
+                g_normals.push_back(0.0f); g_normals.push_back(0.0f); g_normals.push_back(1.0f);
+
+                int p1 = (int)g_vertices.size() / 3;
+                g_vertices.push_back(old_vertices[b*3]);
+                g_vertices.push_back(old_vertices[b*3+1]);
+                g_vertices.push_back(old_vertices[b*3+2]);
+                g_normals.push_back(0.0f); g_normals.push_back(0.0f); g_normals.push_back(1.0f);
+
+                int p2 = (int)g_vertices.size() / 3;
+                g_vertices.push_back(old_vertices[b*3] + avg_nx * offset);
+                g_vertices.push_back(old_vertices[b*3+1] + avg_ny * offset);
+                g_vertices.push_back(old_vertices[b*3+2] + avg_nz * offset);
+                g_normals.push_back(0.0f); g_normals.push_back(0.0f); g_normals.push_back(1.0f);
+
+                // Triangle 2: (a, nb, na)
+                int p3 = (int)g_vertices.size() / 3;
+                g_vertices.push_back(old_vertices[a*3]);
+                g_vertices.push_back(old_vertices[a*3+1]);
+                g_vertices.push_back(old_vertices[a*3+2]);
+                g_normals.push_back(0.0f); g_normals.push_back(0.0f); g_normals.push_back(1.0f);
+
+                int p4 = (int)g_vertices.size() / 3;
+                g_vertices.push_back(old_vertices[b*3] + avg_nx * offset);
+                g_vertices.push_back(old_vertices[b*3+1] + avg_ny * offset);
+                g_vertices.push_back(old_vertices[b*3+2] + avg_nz * offset);
+                g_normals.push_back(0.0f); g_normals.push_back(0.0f); g_normals.push_back(1.0f);
+
+                int p5 = (int)g_vertices.size() / 3;
+                g_vertices.push_back(old_vertices[a*3] + avg_nx * offset);
+                g_vertices.push_back(old_vertices[a*3+1] + avg_ny * offset);
+                g_vertices.push_back(old_vertices[a*3+2] + avg_nz * offset);
+                g_normals.push_back(0.0f); g_normals.push_back(0.0f); g_normals.push_back(1.0f);
+
+                // Add the two triangles (ensure correct winding for outward normals)
+                // For triangle 1: (a, b, nb)
+                g_indices.push_back((unsigned int)p0);
+                g_indices.push_back((unsigned int)p1);
+                g_indices.push_back((unsigned int)p2);
+                // For triangle 2: (a, nb, na)
+                g_indices.push_back((unsigned int)p3);
+                g_indices.push_back((unsigned int)p4);
+                g_indices.push_back((unsigned int)p5);
             }
         }
     }
-    
-    // ---- 6. Clean up selection and refresh ----
+
+    // ---- Clear selection ----
     g_selected_faces.clear();
-    g_selected_edges.clear(); // just in case
+    g_selected_edges.clear();
     g_selected.clear();
+
+    // ---- Recompute normals (now each triangle has unique vertices, so normals will be per-triangle) ----
     update_mesh_buffers();
+    // Since each vertex is used by only one triangle, compute_normals() will set each vertex normal to the face normal.
+    compute_normals();
     update_gizmo_selection();
+
+    printf("Extrude complete (flat shading enforced)\n");
 }

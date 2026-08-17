@@ -261,6 +261,19 @@ int main() {
             update_gizmo_selection();
         }
 
+        if (ImGui::IsKeyPressed(ImGuiKey_E) && !ImGui::IsAnyItemActive()) {
+            if (g_sel_mode == SELECT_FACE && !g_selected_faces.empty()) {
+                push_undo();
+                extrude_selected();
+            } else if (g_sel_mode == SELECT_EDGE && !g_selected_edges.empty()) {
+                // Edge extrude not implemented yet, but we can add a message
+                printf("Edge extrude not implemented yet\n");
+            } else if (g_sel_mode == SELECT_VERTEX && !g_selected.empty()) {
+                // Vertex extrude not implemented yet
+                printf("Vertex extrude not implemented yet\n");
+            }
+        }
+
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
         glClearColor(0.12f, 0.12f, 0.16f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT);

@@ -142,5 +142,14 @@ void PropertiesWindow() {
         }
     }
 
+    ImGui::Separator();
+    ImGui::Text("Extrude");
+    if (ImGui::Button("Extrude Faces (E)")) {
+        if (!g_selected_faces.empty()) {
+            push_undo();
+            extrude_selected();
+        }
+    }
+
     ImGui::End();
 }
