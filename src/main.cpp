@@ -51,6 +51,20 @@ float g_gizmo_pos[3] = {0.0f, 0.0f, 0.0f};
 std::vector<int> g_gizmo_verts;
 float g_gizmo_size = 0.8f;
 
+float g_bevel_width = 0.1f;
+
+std::vector<MeshFace> g_face_list;
+
+bool g_knife_active = false;
+int g_knife_stage = 0;
+float g_knife_start[3] = {0.0f, 0.0f, 0.0f};
+float g_knife_end[3] = {0.0f, 0.0f, 0.0f};
+
+bool g_draw_face_active = false;
+int g_draw_face_face_idx = -1;
+std::vector<std::array<float,3>> g_draw_face_points;
+
+
 int main() {
     glfwInit();
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
@@ -111,7 +125,7 @@ int main() {
             if(ImGui::BeginMenu("File")) {
                 if(ImGui::MenuItem("New Project")) {
                     push_undo();
-                    g_vertices.clear(); g_normals.clear(); g_indices.clear(); g_selected.clear();
+                    g_vertices.clear(); g_normals.clear(); g_indices.clear(); g_selected.clear(); g_face_list.clear();  
                     g_selected_edges.clear();
                     g_selected_faces.clear();
                     g_gizmo_verts.clear();
@@ -215,6 +229,11 @@ int main() {
                 g_selected.clear();
                 update_mesh_buffers();
                 update_gizmo_selection();
+            } else if (g_selected.size() >= 4) {
+                make_face_from_selected();
+                // (make_face_from_selected already calls update_mesh_buffers)
+            } else {
+                printf("Select at least 2 vertices to fill.\n");
             }
         }
 

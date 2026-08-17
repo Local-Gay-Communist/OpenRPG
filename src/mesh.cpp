@@ -11,8 +11,145 @@
 #include <map>
 #include <set>
 #include "viewport.h"
+#include <array>   
+#include <queue>
 
 // ---- Topology-modifying functions clear edge/face selections ----
+
+void get_face_boundary(int face_idx, std::vector<int>& boundary_verts) {
+    boundary_verts.clear();
+    if (face_idx < 0 || face_idx >= (int)g_face_list.size()) return;
+
+    MeshFace& face = g_face_list[face_idx];
+    std::map<std::pair<int,int>, int> edge_count;
+    for (int tri : face.tri_indices) {
+        int a = g_indices[tri*3], b = g_indices[tri*3+1], c = g_indices[tri*3+2];
+        int edges[3][2] = {{a,b},{b,c},{c,a}};
+        for (int j = 0; j < 3; ++j) {
+            int u = std::min(edges[j][0], edges[j][1]);
+            int v = std::max(edges[j][0], edges[j][1]);
+            edge_count[{u,v}]++;
+        }
+    }
+
+    std::vector<std::pair<int,int>> boundary_edges;
+    for (auto& kv : edge_count) {
+        if (kv.second == 1) boundary_edges.push_back(kv.first);
+    }
+    if (boundary_edges.empty()) return;
+
+    // Order them into a polygon
+    int start = boundary_edges[0].first;
+    int cur = boundary_edges[0].second;
+    boundary_verts.push_back(start);
+    boundary_verts.push_back(cur);
+
+    std::map<int, std::vector<int>> adj;
+    for (auto& e : boundary_edges) {
+        adj[e.first].push_back(e.second);
+        adj[e.second].push_back(e.first);
+    }
+
+    while (cur != start) {
+        auto& neighbors = adj[cur];
+        int next = -1;
+        for (int n : neighbors) {
+            if (n != boundary_verts[boundary_verts.size()-2]) { next = n; break; }
+        }
+        if (next == -1) break;
+        boundary_verts.push_back(next);
+        cur = next;
+    }
+}
+
+void triangulate_polygon(const std::vector<int>& verts, std::vector<unsigned int>& out_indices) {
+    if (verts.size() < 3) return;
+    int first = verts[0];
+    for (size_t i = 1; i + 1 < verts.size(); ++i) {
+        out_indices.push_back((unsigned int)first);
+        out_indices.push_back((unsigned int)verts[i]);
+        out_indices.push_back((unsigned int)verts[i+1]);
+    }
+}
+
+void get_face_plane(int face_idx, float& nx, float& ny, float& nz, float& d) {
+    if (face_idx < 0 || face_idx >= (int)g_face_list.size()) { nx=0; ny=0; nz=1; d=0; return; }
+    MeshFace& face = g_face_list[face_idx];
+    int tri0 = face.tri_indices[0];
+    int a = g_indices[tri0*3], b = g_indices[tri0*3+1], c = g_indices[tri0*3+2];
+    float ax = g_vertices[a*3], ay = g_vertices[a*3+1], az = g_vertices[a*3+2];
+    float bx = g_vertices[b*3], by = g_vertices[b*3+1], bz = g_vertices[b*3+2];
+    float cx = g_vertices[c*3], cy = g_vertices[c*3+1], cz = g_vertices[c*3+2];
+    float ex1 = bx-ax, ey1 = by-ay, ez1 = bz-az;
+    float ex2 = cx-ax, ey2 = cy-ay, ez2 = cz-az;
+    nx = ey1*ez2 - ez1*ey2;
+    ny = ez1*ex2 - ex1*ez2;
+    nz = ex1*ey2 - ey1*ex2;
+    float len = sqrtf(nx*nx + ny*ny + nz*nz);
+    if (len > 0.0001f) { nx /= len; ny /= len; nz /= len; }
+    else { nx = 0; ny = 0; nz = 1; }
+    d = -(nx*ax + ny*ay + nz*az);
+}
+
+static std::array<float,3> project_onto_plane(const float p[3], float nx, float ny, float nz, float d) {
+    float dist = nx*p[0] + ny*p[1] + nz*p[2] + d;
+    return {p[0] - dist*nx, p[1] - dist*ny, p[2] - dist*nz};
+}
+
+// Clip a polygon (subject) against a single edge of the clip polygon.
+// The clip edge is defined by two points (A, B) in 2D (projected coordinates).
+// We'll work in 3D but operate on the plane.
+static std::vector<std::array<float,3>> clip_polygon_against_edge(
+    const std::vector<std::array<float,3>>& subject,
+    const std::array<float,3>& A,
+    const std::array<float,3>& B,
+    float nx, float ny, float nz) // face normal (for inside test)
+{
+    std::vector<std::array<float,3>> output;
+    if (subject.empty()) return output;
+
+    // Compute normal of the clip edge in the face plane: cross(face_normal, (B-A))
+    float ex = B[0]-A[0], ey = B[1]-A[1], ez = B[2]-A[2];
+    float cnx = ny*ez - nz*ey;
+    float cny = nz*ex - nx*ez;
+    float cnz = nx*ey - ny*ex;
+    // normalize
+    float len = sqrtf(cnx*cnx + cny*cny + cnz*cnz);
+    if (len < 1e-8f) return subject; // edge too small
+    cnx /= len; cny /= len; cnz /= len;
+
+    // Plane constant for clip edge (through A)
+    float c_d = -(cnx*A[0] + cny*A[1] + cnz*A[2]);
+
+    // We'll use the signed distance to determine inside/outside.
+    // Inside = distance >= 0 (point is on the same side as the polygon interior).
+    // For convex polygon, interior is to the left of each edge (A->B).
+    // We'll test if a point is inside by checking its distance to the edge plane.
+    auto dist_to_edge = [&](const std::array<float,3>& P) -> float {
+        return cnx*P[0] + cny*P[1] + cnz*P[2] + c_d;
+    };
+
+    int n = subject.size();
+    for (int i = 0; i < n; ++i) {
+        const auto& S = subject[i];
+        const auto& E = subject[(i+1)%n];
+        float dS = dist_to_edge(S);
+        float dE = dist_to_edge(E);
+        if (dS >= 0) {
+            output.push_back(S);
+        }
+        if ((dS > 0 && dE < 0) || (dS < 0 && dE > 0)) {
+            // Intersection point
+            float t = dS / (dS - dE);
+            std::array<float,3> I;
+            I[0] = S[0] + t*(E[0]-S[0]);
+            I[1] = S[1] + t*(E[1]-S[1]);
+            I[2] = S[2] + t*(E[2]-S[2]);
+            output.push_back(I);
+        }
+    }
+    return output;
+}
 
 int find_closest_vertex(float x, float y, float max_dist) {
     int best = -1;
@@ -153,6 +290,8 @@ void update_mesh_buffers() {
     glBufferData(GL_ARRAY_BUFFER, interleaved.size() * sizeof(float), interleaved.data(), GL_DYNAMIC_DRAW);
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, EBO);
     glBufferData(GL_ELEMENT_ARRAY_BUFFER, g_indices.size() * sizeof(unsigned int), g_indices.data(), GL_DYNAMIC_DRAW);
+
+    rebuild_faces();
 }
 
 // ---- Polygon Tools ----
@@ -566,4 +705,679 @@ void extrude_selected() {
     update_gizmo_selection();
 
     printf("Extrude complete (flat shading enforced)\n");
+}
+
+void weld_vertices(float threshold, bool weld_selected_to_center, bool weld_selected_to_first) {
+    if (g_vertices.empty()) return;
+
+    if (weld_selected_to_center || weld_selected_to_first) {
+        if (g_selected.size() < 2) return;
+
+        float tx = 0, ty = 0, tz = 0;
+        if (weld_selected_to_center) {
+            for (int idx : g_selected) {
+                tx += g_vertices[idx*3];
+                ty += g_vertices[idx*3+1];
+                tz += g_vertices[idx*3+2];
+            }
+            tx /= g_selected.size();
+            ty /= g_selected.size();
+            tz /= g_selected.size();
+        } else {
+            int first = g_selected[0];
+            tx = g_vertices[first*3];
+            ty = g_vertices[first*3+1];
+            tz = g_vertices[first*3+2];
+        }
+
+        int target_idx = g_selected[0];
+        g_vertices[target_idx*3] = tx;
+        g_vertices[target_idx*3+1] = ty;
+        g_vertices[target_idx*3+2] = tz;
+
+        for (size_t i = 0; i < g_indices.size(); ++i) {
+            int v = (int)g_indices[i];
+            if (std::find(g_selected.begin(), g_selected.end(), v) != g_selected.end() && v != target_idx) {
+                g_indices[i] = (unsigned int)target_idx;
+            }
+        }
+
+        std::vector<bool> keep(g_vertices.size()/3, true);
+        for (int idx : g_selected) {
+            if (idx != target_idx) keep[idx] = false;
+        }
+        std::vector<float> new_verts;
+        std::vector<int> remap(g_vertices.size()/3, -1);
+        for (size_t i = 0; i < keep.size(); ++i) {
+            if (keep[i]) {
+                remap[i] = (int)new_verts.size()/3;
+                new_verts.push_back(g_vertices[i*3]);
+                new_verts.push_back(g_vertices[i*3+1]);
+                new_verts.push_back(g_vertices[i*3+2]);
+            }
+        }
+        for (size_t i = 0; i < g_indices.size(); ++i) {
+            int old = (int)g_indices[i];
+            g_indices[i] = (unsigned int)remap[old];
+        }
+        g_vertices = new_verts;
+        g_selected.clear();
+        g_selected_faces.clear();
+        g_selected_edges.clear();
+        update_mesh_buffers();
+        compute_normals();
+        rebuild_faces();
+        update_gizmo_selection();
+        return;
+    }
+
+    // ---- Original weld by distance ----
+    int old_count = (int)g_vertices.size() / 3;
+    std::vector<float> new_verts;
+    std::vector<int> remap(g_vertices.size() / 3, -1);
+
+    for (size_t i = 0; i < g_vertices.size() / 3; i++) {
+        bool found = false;
+        for (size_t j = 0; j < new_verts.size() / 3; j++) {
+            float dx = g_vertices[i*3] - new_verts[j*3];
+            float dy = g_vertices[i*3+1] - new_verts[j*3+1];
+            float dz = g_vertices[i*3+2] - new_verts[j*3+2];
+            if (dx*dx + dy*dy + dz*dz < threshold*threshold) {
+                remap[i] = (int)j;
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            remap[i] = (int)(new_verts.size() / 3);
+            new_verts.push_back(g_vertices[i*3]);
+            new_verts.push_back(g_vertices[i*3+1]);
+            new_verts.push_back(g_vertices[i*3+2]);
+        }
+    }
+
+    for (size_t i = 0; i < g_indices.size(); i++) {
+        g_indices[i] = (unsigned int)remap[(int)g_indices[i]];
+    }
+
+    g_vertices = new_verts;
+    g_selected_faces.clear();
+    g_selected_edges.clear();
+    update_mesh_buffers();
+    compute_normals();
+    rebuild_faces();
+    update_gizmo_selection();
+    printf("Welded vertices: %d -> %zu\n", old_count, g_vertices.size()/3);
+}
+
+// ---- Split Edge (winding-preserving) ----
+void split_edge(int v0, int v1, float t) {
+    if (t <= 0.0f || t >= 1.0f) return;
+
+    int a = std::min(v0, v1);
+    int b = std::max(v0, v1);
+
+    std::map<std::pair<int,int>, std::vector<int>> edge_to_tris;
+    for (size_t i = 0; i < g_indices.size() / 3; ++i) {
+        int v[3] = { (int)g_indices[i*3], (int)g_indices[i*3+1], (int)g_indices[i*3+2] };
+        for (int j = 0; j < 3; ++j) {
+            int u = std::min(v[j], v[(j+1)%3]);
+            int w = std::max(v[j], v[(j+1)%3]);
+            edge_to_tris[{u,w}].push_back((int)i);
+        }
+    }
+
+    auto it = edge_to_tris.find({a,b});
+    if (it == edge_to_tris.end()) return;
+    const std::vector<int>& tri_indices = it->second;
+    if (tri_indices.empty()) return;
+
+    // Create new vertex
+    float new_x = g_vertices[a*3] + t * (g_vertices[b*3] - g_vertices[a*3]);
+    float new_y = g_vertices[a*3+1] + t * (g_vertices[b*3+1] - g_vertices[a*3+1]);
+    float new_z = g_vertices[a*3+2] + t * (g_vertices[b*3+2] - g_vertices[a*3+2]);
+    int new_idx = (int)g_vertices.size() / 3;
+    g_vertices.push_back(new_x);
+    g_vertices.push_back(new_y);
+    g_vertices.push_back(new_z);
+    g_normals.push_back(0.0f);
+    g_normals.push_back(0.0f);
+    g_normals.push_back(1.0f);
+
+    std::vector<unsigned int> new_indices;
+    new_indices.reserve(g_indices.size() + tri_indices.size() * 3);
+
+    auto compute_tri_normal = [&](int a, int b, int c) -> std::array<float,3> {
+        float ax = g_vertices[a*3], ay = g_vertices[a*3+1], az = g_vertices[a*3+2];
+        float bx = g_vertices[b*3], by = g_vertices[b*3+1], bz = g_vertices[b*3+2];
+        float cx = g_vertices[c*3], cy = g_vertices[c*3+1], cz = g_vertices[c*3+2];
+        float ex1 = bx-ax, ey1 = by-ay, ez1 = bz-az;
+        float ex2 = cx-ax, ey2 = cy-ay, ez2 = cz-az;
+        float nx = ey1*ez2 - ez1*ey2;
+        float ny = ez1*ex2 - ex1*ez2;
+        float nz = ex1*ey2 - ey1*ex2;
+        float len = sqrtf(nx*nx + ny*ny + nz*nz);
+        if (len > 0.0001f) return {nx/len, ny/len, nz/len};
+        return {0.0f, 0.0f, 1.0f};
+    };
+
+    for (size_t i = 0; i < g_indices.size() / 3; ++i) {
+        bool should_split = false;
+        for (int idx : tri_indices) {
+            if ((int)i == idx) { should_split = true; break; }
+        }
+
+        if (should_split) {
+            int v[3] = { (int)g_indices[i*3], (int)g_indices[i*3+1], (int)g_indices[i*3+2] };
+            int pos_a = -1, pos_b = -1;
+            for (int j = 0; j < 3; ++j) {
+                if (v[j] == a) pos_a = j;
+                if (v[j] == b) pos_b = j;
+            }
+            int c = -1;
+            for (int j = 0; j < 3; ++j) {
+                if (v[j] != a && v[j] != b) { c = v[j]; break; }
+            }
+            if (pos_a == -1 || pos_b == -1 || c == -1) continue;
+
+            std::array<float,3> orig_n = compute_tri_normal(v[0], v[1], v[2]);
+
+            auto add_tri = [&](int a, int b, int c) {
+                std::array<float,3> tri_n = compute_tri_normal(a, b, c);
+                float dot = tri_n[0]*orig_n[0] + tri_n[1]*orig_n[1] + tri_n[2]*orig_n[2];
+                if (dot < 0.0f) std::swap(b, c);
+                new_indices.push_back((unsigned int)a);
+                new_indices.push_back((unsigned int)b);
+                new_indices.push_back((unsigned int)c);
+            };
+
+            add_tri(a, new_idx, c);
+            add_tri(new_idx, b, c);
+        } else {
+            new_indices.push_back(g_indices[i*3]);
+            new_indices.push_back(g_indices[i*3+1]);
+            new_indices.push_back(g_indices[i*3+2]);
+        }
+    }
+
+    g_indices = new_indices;
+
+    // FIXED: topology changed — clear stale selections and rebuild face groups
+    g_selected_faces.clear();
+    g_selected_edges.clear();
+
+    update_mesh_buffers();
+    compute_normals();
+    rebuild_faces();
+    update_gizmo_selection();
+}
+
+// ---- Knife Cut (winding-preserving, edge-cached) ----
+void knife_cut(const float start[3], const float end[3]) {
+    extern float cam_theta, cam_phi;
+    float vx = -sinf(cam_theta) * cosf(cam_phi);
+    float vy = -sinf(cam_phi);
+    float vz = -cosf(cam_theta) * cosf(cam_phi);
+    float len_v = sqrtf(vx*vx + vy*vy + vz*vz);
+    if (len_v < 0.0001f) { vx = 0; vy = 0; vz = 1; len_v = 1; }
+    vx /= len_v; vy /= len_v; vz /= len_v;
+
+    float lx = end[0] - start[0];
+    float ly = end[1] - start[1];
+    float lz = end[2] - start[2];
+    float len_l = sqrtf(lx*lx + ly*ly + lz*lz);
+    if (len_l < 0.0001f) {
+        printf("Knife: start and end are too close - aborting.\n");
+        return;
+    }
+
+    float nx = ly * vz - lz * vy;
+    float ny = lz * vx - lx * vz;
+    float nz = lx * vy - ly * vx;
+    float len_n = sqrtf(nx*nx + ny*ny + nz*nz);
+    if (len_n < 0.0001f) {
+        printf("Knife: line is parallel to view direction - aborting.\n");
+        return;
+    }
+    nx /= len_n; ny /= len_n; nz /= len_n;
+
+    float d_plane = -(nx * start[0] + ny * start[1] + nz * start[2]);
+
+    std::map<std::pair<int,int>, int> edge_vert_cache;
+
+    auto get_intersection = [&](int a, int b, float da, float db) -> int {
+        if (a > b) { std::swap(a, b); std::swap(da, db); }
+        auto key = std::make_pair(a, b);
+        auto it = edge_vert_cache.find(key);
+        if (it != edge_vert_cache.end()) return it->second;
+
+        float t = da / (da - db);
+        float new_x = g_vertices[a*3] + t * (g_vertices[b*3] - g_vertices[a*3]);
+        float new_y = g_vertices[a*3+1] + t * (g_vertices[b*3+1] - g_vertices[a*3+1]);
+        float new_z = g_vertices[a*3+2] + t * (g_vertices[b*3+2] - g_vertices[a*3+2]);
+        int idx = (int)g_vertices.size() / 3;
+        g_vertices.push_back(new_x);
+        g_vertices.push_back(new_y);
+        g_vertices.push_back(new_z);
+        g_normals.push_back(0.0f);
+        g_normals.push_back(0.0f);
+        g_normals.push_back(1.0f);
+        edge_vert_cache[key] = idx;
+        return idx;
+    };
+
+    auto compute_tri_normal = [&](int a, int b, int c) -> std::array<float,3> {
+        float ax = g_vertices[a*3], ay = g_vertices[a*3+1], az = g_vertices[a*3+2];
+        float bx = g_vertices[b*3], by = g_vertices[b*3+1], bz = g_vertices[b*3+2];
+        float cx = g_vertices[c*3], cy = g_vertices[c*3+1], cz = g_vertices[c*3+2];
+        float ex1 = bx-ax, ey1 = by-ay, ez1 = bz-az;
+        float ex2 = cx-ax, ey2 = cy-ay, ez2 = cz-az;
+        float nx = ey1*ez2 - ez1*ey2;
+        float ny = ez1*ex2 - ex1*ez2;
+        float nz = ex1*ey2 - ey1*ex2;
+        float len = sqrtf(nx*nx + ny*ny + nz*nz);
+        if (len > 0.0001f) return {nx/len, ny/len, nz/len};
+        return {0.0f, 0.0f, 1.0f};
+    };
+
+    std::vector<unsigned int> new_indices;
+    new_indices.reserve(g_indices.size() * 2);
+
+    const float EPS = 1e-6f;
+
+    for (size_t i = 0; i < g_indices.size() / 3; ++i) {
+        int v[3] = { (int)g_indices[i*3], (int)g_indices[i*3+1], (int)g_indices[i*3+2] };
+        float d0 = g_vertices[v[0]*3]*nx + g_vertices[v[0]*3+1]*ny + g_vertices[v[0]*3+2]*nz + d_plane;
+        float d1 = g_vertices[v[1]*3]*nx + g_vertices[v[1]*3+1]*ny + g_vertices[v[1]*3+2]*nz + d_plane;
+        float d2 = g_vertices[v[2]*3]*nx + g_vertices[v[2]*3+1]*ny + g_vertices[v[2]*3+2]*nz + d_plane;
+
+        int neg_count = (d0 < -EPS) + (d1 < -EPS) + (d2 < -EPS);
+        int pos_count = (d0 > EPS) + (d1 > EPS) + (d2 > EPS);
+
+        if (pos_count == 0 || neg_count == 0) {
+            new_indices.push_back(g_indices[i*3]);
+            new_indices.push_back(g_indices[i*3+1]);
+            new_indices.push_back(g_indices[i*3+2]);
+            continue;
+        }
+
+        std::array<float,3> orig_n = compute_tri_normal(v[0], v[1], v[2]);
+
+        float dist[3] = {d0, d1, d2};
+        int verts[3] = {v[0], v[1], v[2]};
+        std::vector<int> pos_verts, neg_verts;
+        // FIXED: bucket using the same EPS tolerance as the count check above,
+        // instead of a bare >= 0 test, to avoid sliver triangles near the cut plane.
+        for (int j = 0; j < 3; ++j) {
+            float dj = (fabsf(dist[j]) <= EPS) ? 0.0f : dist[j];
+            if (dj >= 0) pos_verts.push_back(verts[j]);
+            else neg_verts.push_back(verts[j]);
+        }
+
+        std::map<int, float> dmap;
+        dmap[v[0]] = d0;
+        dmap[v[1]] = d1;
+        dmap[v[2]] = d2;
+
+        auto get_intersection_for_edge = [&](int a, int b) -> int {
+            float da = dmap[a], db = dmap[b];
+            return get_intersection(a, b, da, db);
+        };
+
+        auto add_tri = [&](int a, int b, int c) {
+            std::array<float,3> tri_n = compute_tri_normal(a, b, c);
+            float dot = tri_n[0]*orig_n[0] + tri_n[1]*orig_n[1] + tri_n[2]*orig_n[2];
+            if (dot < 0.0f) std::swap(b, c);
+            new_indices.push_back((unsigned int)a);
+            new_indices.push_back((unsigned int)b);
+            new_indices.push_back((unsigned int)c);
+        };
+
+        if (pos_verts.size() == 1 && neg_verts.size() == 2) {
+            int p = pos_verts[0];
+            int n1 = neg_verts[0];
+            int n2 = neg_verts[1];
+            int i1 = get_intersection_for_edge(p, n1);
+            int i2 = get_intersection_for_edge(p, n2);
+            add_tri(p, i1, i2);
+            add_tri(i1, n1, n2);
+            add_tri(i1, n2, i2);
+        } else if (pos_verts.size() == 2 && neg_verts.size() == 1) {
+            int p1 = pos_verts[0], p2 = pos_verts[1];
+            int n = neg_verts[0];
+            int i1 = get_intersection_for_edge(p1, n);
+            int i2 = get_intersection_for_edge(p2, n);
+            add_tri(p1, p2, i1);
+            add_tri(p2, i2, i1);
+            add_tri(i1, i2, n);
+        } else {
+            // Degenerate case after EPS re-bucketing (e.g. all on one side) — keep original tri
+            new_indices.push_back((unsigned int)v[0]);
+            new_indices.push_back((unsigned int)v[1]);
+            new_indices.push_back((unsigned int)v[2]);
+        }
+    }
+
+    g_indices = new_indices;
+
+    // FIXED: topology fully changed — clear stale selection state and rebuild
+    // face groups so face-select mode doesn't reference the wrong triangles.
+    g_selected.clear();
+    g_selected_faces.clear();
+    g_selected_edges.clear();
+
+    update_mesh_buffers();
+    compute_normals();
+    rebuild_faces();
+    update_gizmo_selection();
+    printf("Knife cut performed (cached edges, winding preserved)\n");
+}
+
+// ---- Unify Normals (flips faces to make normals consistent) ----
+void unify_normals() {
+    if (g_indices.empty()) return;
+
+    int num_tris = (int)g_indices.size() / 3;
+    std::vector<bool> visited(num_tris, false);
+    std::vector<std::array<float,3>> tri_normals(num_tris);
+
+    for (int i = 0; i < num_tris; ++i) {
+        int a = g_indices[i*3], b = g_indices[i*3+1], c = g_indices[i*3+2];
+        float ax = g_vertices[a*3], ay = g_vertices[a*3+1], az = g_vertices[a*3+2];
+        float bx = g_vertices[b*3], by = g_vertices[b*3+1], bz = g_vertices[b*3+2];
+        float cx = g_vertices[c*3], cy = g_vertices[c*3+1], cz = g_vertices[c*3+2];
+        float ex1 = bx-ax, ey1 = by-ay, ez1 = bz-az;
+        float ex2 = cx-ax, ey2 = cy-ay, ez2 = cz-az;
+        float nx = ey1*ez2 - ez1*ey2;
+        float ny = ez1*ex2 - ex1*ez2;
+        float nz = ex1*ey2 - ey1*ex2;
+        float len = sqrtf(nx*nx + ny*ny + nz*nz);
+        if (len > 0.0001f) tri_normals[i] = {nx/len, ny/len, nz/len};
+        else tri_normals[i] = {0,0,1};
+    }
+
+    std::map<std::pair<int,int>, std::vector<int>> edge_to_tris;
+    for (int i = 0; i < num_tris; ++i) {
+        int a = g_indices[i*3], b = g_indices[i*3+1], c = g_indices[i*3+2];
+        int edges[3][2] = {{a,b}, {b,c}, {c,a}};
+        for (int j = 0; j < 3; ++j) {
+            int u = std::min(edges[j][0], edges[j][1]);
+            int v = std::max(edges[j][0], edges[j][1]);
+            edge_to_tris[{u,v}].push_back(i);
+        }
+    }
+
+    int flip_count = 0;
+    for (int start = 0; start < num_tris; ++start) {
+        if (visited[start]) continue;
+
+        std::queue<int> q;
+        q.push(start);
+        visited[start] = true;
+
+        while (!q.empty()) {
+            int t = q.front();
+            q.pop();
+
+            int a = g_indices[t*3], b = g_indices[t*3+1], c = g_indices[t*3+2];
+            int edges[3][2] = {{a,b}, {b,c}, {c,a}};
+
+            for (int j = 0; j < 3; ++j) {
+                int u = std::min(edges[j][0], edges[j][1]);
+                int v = std::max(edges[j][0], edges[j][1]);
+                auto it = edge_to_tris.find({u,v});
+                if (it == edge_to_tris.end()) continue;
+
+                for (int neighbor : it->second) {
+                    if (visited[neighbor]) continue;
+
+                    float dot = tri_normals[t][0]*tri_normals[neighbor][0] +
+                                tri_normals[t][1]*tri_normals[neighbor][1] +
+                                tri_normals[t][2]*tri_normals[neighbor][2];
+
+                    if (dot < 0.0f) {
+                        int idx0 = neighbor*3, idx1 = neighbor*3+1, idx2 = neighbor*3+2;
+                        std::swap(g_indices[idx1], g_indices[idx2]);
+                        tri_normals[neighbor] = {-tri_normals[neighbor][0],
+                                                  -tri_normals[neighbor][1],
+                                                  -tri_normals[neighbor][2]};
+                        flip_count++;
+                    }
+
+                    visited[neighbor] = true;
+                    q.push(neighbor);
+                }
+            }
+        }
+    }
+
+    update_mesh_buffers();
+    compute_normals();
+    printf("Unified normals: flipped %d faces\n", flip_count);
+}
+
+// ---- Rebuild Faces (already existing, included for completeness) ----
+void rebuild_faces() {
+    g_face_list.clear();
+    if (g_indices.empty()) return;
+    int num_tris = (int)g_indices.size() / 3;
+    if (num_tris == 0) return;
+
+    std::vector<bool> visited(num_tris, false);
+    std::map<std::pair<int,int>, std::vector<int>> edge_to_tris;
+    for (int i = 0; i < num_tris; i++) {
+        int a = (int)g_indices[i*3];
+        int b = (int)g_indices[i*3+1];
+        int c = (int)g_indices[i*3+2];
+        int edges[3][2] = {{a,b}, {b,c}, {c,a}};
+        for (int j = 0; j < 3; j++) {
+            int u = std::min(edges[j][0], edges[j][1]);
+            int v = std::max(edges[j][0], edges[j][1]);
+            edge_to_tris[{u,v}].push_back(i);
+        }
+    }
+
+    std::vector<std::array<float,3>> tri_normals(num_tris);
+    for (int i = 0; i < num_tris; i++) {
+        int a = (int)g_indices[i*3];
+        int b = (int)g_indices[i*3+1];
+        int c = (int)g_indices[i*3+2];
+        float ax = g_vertices[a*3], ay = g_vertices[a*3+1], az = g_vertices[a*3+2];
+        float bx = g_vertices[b*3], by = g_vertices[b*3+1], bz = g_vertices[b*3+2];
+        float cx = g_vertices[c*3], cy = g_vertices[c*3+1], cz = g_vertices[c*3+2];
+        float ex1 = bx-ax, ey1 = by-ay, ez1 = bz-az;
+        float ex2 = cx-ax, ey2 = cy-ay, ez2 = cz-az;
+        float nx = ey1*ez2 - ez1*ey2;
+        float ny = ez1*ex2 - ex1*ez2;
+        float nz = ex1*ey2 - ey1*ex2;
+        float len = sqrtf(nx*nx + ny*ny + nz*nz);
+        if (len > 0.0001f) tri_normals[i] = {nx/len, ny/len, nz/len};
+        else tri_normals[i] = {0,0,1};
+    }
+
+    const float COPLANAR_THRESHOLD = 0.99f;
+    for (int i = 0; i < num_tris; i++) {
+        if (visited[i]) continue;
+        std::vector<int> tri_group;
+        std::queue<int> q;
+        q.push(i);
+        visited[i] = true;
+        while (!q.empty()) {
+            int t = q.front();
+            q.pop();
+            tri_group.push_back(t);
+            int a = (int)g_indices[t*3];
+            int b = (int)g_indices[t*3+1];
+            int c = (int)g_indices[t*3+2];
+            int edges[3][2] = {{a,b}, {b,c}, {c,a}};
+            for (int j = 0; j < 3; j++) {
+                int u = std::min(edges[j][0], edges[j][1]);
+                int v = std::max(edges[j][0], edges[j][1]);
+                auto it = edge_to_tris.find({u,v});
+                if (it == edge_to_tris.end()) continue;
+                for (int neighbor : it->second) {
+                    if (visited[neighbor]) continue;
+                    float dot = tri_normals[t][0]*tri_normals[neighbor][0] +
+                                tri_normals[t][1]*tri_normals[neighbor][1] +
+                                tri_normals[t][2]*tri_normals[neighbor][2];
+                    if (dot > COPLANAR_THRESHOLD) {
+                        visited[neighbor] = true;
+                        q.push(neighbor);
+                    }
+                }
+            }
+        }
+        if (!tri_group.empty()) {
+            MeshFace face;
+            face.tri_indices = tri_group;
+            g_face_list.push_back(face);
+        }
+    }
+}
+
+// ---- Make Face from selected vertices (fan triangulation) ----
+void make_face_from_selected() {
+    if (g_selected.size() < 3) {
+        printf("Need at least 3 vertices selected.\n");
+        return;
+    }
+
+    // Compute centroid
+    float cx = 0.0f, cy = 0.0f, cz = 0.0f;
+    for (int idx : g_selected) {
+        cx += g_vertices[idx*3];
+        cy += g_vertices[idx*3+1];
+        cz += g_vertices[idx*3+2];
+    }
+    cx /= g_selected.size();
+    cy /= g_selected.size();
+    cz /= g_selected.size();
+
+    // Sort vertices by angle around centroid (projected onto XY plane)
+    // This works well for convex polygons; for concave it may produce some overlapping,
+    // but it's a reasonable low‑poly approximation.
+    std::sort(g_selected.begin(), g_selected.end(),
+        [&](int a, int b) {
+            float ax = g_vertices[a*3] - cx;
+            float ay = g_vertices[a*3+1] - cy;
+            float bx = g_vertices[b*3] - cx;
+            float by = g_vertices[b*3+1] - cy;
+            return atan2(ay, ax) < atan2(by, bx);
+        });
+
+    // Fan triangulation: (v0, v1, v2), (v0, v2, v3), ...
+    int first = g_selected[0];
+    for (size_t i = 1; i + 1 < g_selected.size(); i++) {
+        add_triangle(first, g_selected[i], g_selected[i+1]);
+    }
+
+    // Clear selection (optional – you may want to keep them selected)
+    g_selected.clear();
+
+    update_mesh_buffers();
+    printf("Created face from %zu vertices.\n", g_selected.size());
+}
+
+void split_face_by_polygon(int face_idx, const std::vector<std::array<float,3>>& points) {
+    if (face_idx < 0 || face_idx >= (int)g_face_list.size()) return;
+    if (points.size() < 3) {
+        printf("Need at least 3 points.\n");
+        return;
+    }
+
+    // ---- 1. Get face plane ----
+    float nx, ny, nz, d;
+    get_face_plane(face_idx, nx, ny, nz, d);
+
+    // ---- 2. Project the drawn points onto the face plane ----
+    std::vector<std::array<float,3>> clip_poly;
+    clip_poly.reserve(points.size());
+    for (const auto& p : points) {
+        std::array<float,3> proj = project_onto_plane(p.data(), nx, ny, nz, d);
+        clip_poly.push_back(proj);
+    }
+
+    // ---- 3. Get the boundary vertices of the original face ----
+    std::vector<int> face_verts;
+    get_face_boundary(face_idx, face_verts);
+    if (face_verts.size() < 3) {
+        printf("Face boundary has less than 3 vertices.\n");
+        return;
+    }
+
+    // ---- 4. Create 3D coordinates for the face boundary ----
+    std::vector<std::array<float,3>> face_poly;
+    for (int v : face_verts) {
+        face_poly.push_back({g_vertices[v*3], g_vertices[v*3+1], g_vertices[v*3+2]});
+    }
+
+    // ---- 5. Clip the face polygon against the drawn polygon (clip_poly) ----
+    // We'll clip the face polygon by each edge of the clip polygon.
+    std::vector<std::array<float,3>> outer_poly = face_poly;
+    for (size_t i = 0; i < clip_poly.size(); ++i) {
+        const auto& A = clip_poly[i];
+        const auto& B = clip_poly[(i+1)%clip_poly.size()];
+        outer_poly = clip_polygon_against_edge(outer_poly, A, B, nx, ny, nz);
+        if (outer_poly.size() < 3) break;
+    }
+
+    // ---- 6. Now we have two polygons: clip_poly (the drawn one) and outer_poly (the rest) ----
+    // We need to create new vertices for the clip polygon if they are not already in the mesh.
+    // We'll create new vertices for all points of clip_poly and outer_poly (except those that coincide with existing vertices).
+    // For simplicity, we'll create new vertices for each point of both polygons (no sharing).
+    // This may produce many vertices but is simple.
+
+    // ---- 7. Build a new index list ----
+    // First, remove the original face's triangles.
+    std::set<int> face_tri_set;
+    for (int tri : g_face_list[face_idx].tri_indices) face_tri_set.insert(tri);
+
+    std::vector<unsigned int> new_indices;
+    // Copy all triangles not belonging to this face
+    for (size_t i = 0; i < g_indices.size() / 3; ++i) {
+        if (face_tri_set.find((int)i) == face_tri_set.end()) {
+            new_indices.push_back(g_indices[i*3]);
+            new_indices.push_back(g_indices[i*3+1]);
+            new_indices.push_back(g_indices[i*3+2]);
+        }
+    }
+
+    // ---- 8. Create vertices and triangles for the drawn polygon (clip_poly) ----
+    std::vector<int> clip_vert_indices;
+    for (auto& p : clip_poly) {
+        clip_vert_indices.push_back((int)g_vertices.size()/3);
+        g_vertices.push_back(p[0]); g_vertices.push_back(p[1]); g_vertices.push_back(p[2]);
+        g_normals.push_back(0.0f); g_normals.push_back(0.0f); g_normals.push_back(1.0f);
+    }
+    // Triangulate clip polygon
+    std::vector<unsigned int> clip_tris;
+    triangulate_polygon(clip_vert_indices, clip_tris);
+    // Add triangles (winding will be corrected later)
+    for (auto idx : clip_tris) new_indices.push_back(idx);
+
+    // ---- 9. Create vertices and triangles for the outer polygon ----
+    std::vector<int> outer_vert_indices;
+    for (auto& p : outer_poly) {
+        outer_vert_indices.push_back((int)g_vertices.size()/3);
+        g_vertices.push_back(p[0]); g_vertices.push_back(p[1]); g_vertices.push_back(p[2]);
+        g_normals.push_back(0.0f); g_normals.push_back(0.0f); g_normals.push_back(1.0f);
+    }
+    // Triangulate outer polygon
+    std::vector<unsigned int> outer_tris;
+    triangulate_polygon(outer_vert_indices, outer_tris);
+    for (auto idx : outer_tris) new_indices.push_back(idx);
+
+    // ---- 10. Replace indices ----
+    g_indices = new_indices;
+
+    // ---- 11. Clear selections and rebuild ----
+    g_selected.clear();
+    g_selected_faces.clear();
+    g_selected_edges.clear();
+
+    update_mesh_buffers();   // rebuilds face groups
+    compute_normals();
+    update_gizmo_selection();
+
+    printf("Face %d split into two faces (drawn polygon and remainder).\n", face_idx);
 }

@@ -10,6 +10,7 @@
 #include <GL/glew.h>
 #include <cmath>
 #include <algorithm>
+#include <queue>
 #include "imgui/imgui.h"
 
 // ---- Helper: ground intersection ----
@@ -105,9 +106,9 @@ static int pick_face(const float* orig, const float* dir, float& out_u, float& o
     int best_tri = -1;
     float best_t = 1e9f;
     for (size_t i = 0; i < g_indices.size() / 3; i++) {
-        int a = g_indices[i*3];
-        int b = g_indices[i*3+1];
-        int c = g_indices[i*3+2];
+        int a = (int)g_indices[i*3];
+        int b = (int)g_indices[i*3+1];
+        int c = (int)g_indices[i*3+2];
         float t, u, v;
         if (ray_triangle_intersect(orig, dir,
                                    &g_vertices[a*3], &g_vertices[b*3], &g_vertices[c*3],
@@ -129,9 +130,9 @@ static std::pair<int,int> pick_edge(const float* orig, const float* dir, float t
     int tri_idx = pick_face(orig, dir, u, v);
     if (tri_idx == -1) return {-1, -1};
     
-    int a = g_indices[tri_idx*3];
-    int b = g_indices[tri_idx*3+1];
-    int c = g_indices[tri_idx*3+2];
+    int a = (int)g_indices[tri_idx*3];
+    int b = (int)g_indices[tri_idx*3+1];
+    int c = (int)g_indices[tri_idx*3+2];
     
     float hit[3];
     hit[0] = (1-u-v)*g_vertices[a*3] + u*g_vertices[b*3] + v*g_vertices[c*3];
@@ -175,9 +176,9 @@ void update_gizmo_selection() {
         }
     } else if (g_sel_mode == SELECT_FACE) {
         for (int tri : g_selected_faces) {
-            g_gizmo_verts.push_back(g_indices[tri*3]);
-            g_gizmo_verts.push_back(g_indices[tri*3+1]);
-            g_gizmo_verts.push_back(g_indices[tri*3+2]);
+            g_gizmo_verts.push_back((int)g_indices[tri*3]);
+            g_gizmo_verts.push_back((int)g_indices[tri*3+1]);
+            g_gizmo_verts.push_back((int)g_indices[tri*3+2]);
         }
     }
     
@@ -344,7 +345,6 @@ static int pick_gizmo(const float* orig, const float* dir) {
 }
 
 // ---- Screen-space gizmo helpers ----
-// Project a 3D point to NDC coordinates (x, y, z in [-1,1])
 static void project_point_to_ndc(const float* world, float* ndc, const Mat4& view, const Mat4& proj, int w, int h) {
     Mat4 mvp = mat4_mul(proj, view);
     float x = world[0], y = world[1], z = world[2];
@@ -438,7 +438,7 @@ void RenderViewportWindow() {
         static ImVec2 click_mouse_pos;
         const float SENSITIVITY = 0.005f;
         const float DRAG_THRESHOLD = 3.0f;
-        
+
         static bool gizmo_dragging = false;
         static int gizmo_drag_axis = -1;
         static float gizmo_prev_ndc_x = 0.0f, gizmo_prev_ndc_y = 0.0f;
@@ -520,7 +520,7 @@ void RenderViewportWindow() {
                 last_mx = mouse_pos.x; last_my = mouse_pos.y;
             }
 
-            // ---- Left‑click ----
+            // ---- Left-click ----
             if (!orbiting && valid_ray) {
                 if (ImGui::IsMouseClicked(0)) {
                     click_vertex = -1;
@@ -528,9 +528,9 @@ void RenderViewportWindow() {
                     drag_vertex = -1;
                     gizmo_dragging = false;
                     undo_pushed_for_gizmo = false;
-                    
-                    // ---- Check gizmo pick ----
-                    if (g_gizmo_enabled && !g_gizmo_verts.empty()) {
+
+                    // ---- Check gizmo pick (still allowed while knife is active off-mesh) ----
+                    if (g_gizmo_enabled && !g_gizmo_verts.empty() && !g_knife_active) {
                         int axis = pick_gizmo(origin, direction);
                         if (axis != -1) {
                             gizmo_dragging = true;
@@ -538,10 +538,10 @@ void RenderViewportWindow() {
                             g_gizmo_axis = axis;
                             gizmo_axis_vec[0] = 0; gizmo_axis_vec[1] = 0; gizmo_axis_vec[2] = 0;
                             gizmo_axis_vec[axis] = 1.0f;
-                            
+
                             gizmo_prev_ndc_x = ndc_x;
                             gizmo_prev_ndc_y = ndc_y;
-                            
+
                             float center_world[3] = {g_gizmo_pos[0], g_gizmo_pos[1], g_gizmo_pos[2]};
                             float axis_tip_world[3] = {center_world[0] + gizmo_axis_vec[0],
                                                        center_world[1] + gizmo_axis_vec[1],
@@ -549,7 +549,7 @@ void RenderViewportWindow() {
                             float center_ndc[3], tip_ndc[3];
                             project_point_to_ndc(center_world, center_ndc, view, proj, viewport_width, viewport_height);
                             project_point_to_ndc(axis_tip_world, tip_ndc, view, proj, viewport_width, viewport_height);
-                            
+
                             float dx_ndc = tip_ndc[0] - center_ndc[0];
                             float dy_ndc = tip_ndc[1] - center_ndc[1];
                             float len = sqrtf(dx_ndc*dx_ndc + dy_ndc*dy_ndc);
@@ -561,13 +561,68 @@ void RenderViewportWindow() {
                                 gizmo_screen_dir[0] = 1; gizmo_screen_dir[1] = 0;
                                 gizmo_world_units_per_ndc = 1.0f;
                             }
-                            
+
                             printf("Gizmo drag start on axis %d\n", axis);
                             goto end_click_handler;
                         }
                     }
-                    
-                    // ---- Normal selection ----
+
+                    // ---- FIXED: Knife tool now takes exclusive priority over normal
+                    // selection / vertex-add while active, so placing knife points
+                    // no longer also raycasts/creates vertices via the selection path. ----
+                    if (g_knife_active) {
+                        float cx = 0.0f, cy = 0.0f, cz = 0.0f;
+                        if (!g_vertices.empty()) {
+                            size_t count = g_vertices.size() / 3;
+                            for (size_t i = 0; i < count; ++i) {
+                                cx += g_vertices[i*3];
+                                cy += g_vertices[i*3+1];
+                                cz += g_vertices[i*3+2];
+                            }
+                            cx /= (float)count;
+                            cy /= (float)count;
+                            cz /= (float)count;
+                        }
+                        float plane_center[3] = {cx, cy, cz};
+
+                        float t_plane = -((origin[0]-plane_center[0])*direction[0] +
+                                          (origin[1]-plane_center[1])*direction[1] +
+                                          (origin[2]-plane_center[2])*direction[2]);
+
+                        if (t_plane > 0) {
+                            float hit[3] = {
+                                origin[0] + t_plane * direction[0],
+                                origin[1] + t_plane * direction[1],
+                                origin[2] + t_plane * direction[2]
+                            };
+
+                            if (g_knife_stage == 0) {
+                                g_knife_start[0] = hit[0];
+                                g_knife_start[1] = hit[1];
+                                g_knife_start[2] = hit[2];
+                                g_knife_stage = 1;
+                                printf("Knife start: (%f, %f, %f)\n", hit[0], hit[1], hit[2]);
+                            } else if (g_knife_stage == 1) {
+                                g_knife_end[0] = hit[0];
+                                g_knife_end[1] = hit[1];
+                                g_knife_end[2] = hit[2];
+                                g_knife_stage = 2;
+                                printf("Knife end: (%f, %f, %f)\n", hit[0], hit[1], hit[2]);
+
+                                push_undo();
+                                knife_cut(g_knife_start, g_knife_end);
+
+                                g_knife_active = false;
+                                g_knife_stage = 0;
+                                printf("Knife cut executed\n");
+                            }
+                        }
+                        // Consume the click entirely — do not fall through to
+                        // normal vertex/edge/face selection below.
+                        goto end_click_handler;
+                    }
+
+                    // ---- Normal selection (only reached when knife is NOT active) ----
                     if (g_sel_mode == SELECT_VERTEX) {
                         click_vertex = raycast_vertex(eye_x, eye_y, eye_z, dir_x, dir_y, dir_z, 0.2f*0.2f);
                     } else if (g_sel_mode == SELECT_EDGE) {
@@ -591,34 +646,54 @@ void RenderViewportWindow() {
                         float u, v;
                         int tri = pick_face(origin, direction, u, v);
                         if (tri != -1) {
-                            if (!ImGui::GetIO().KeyShift) g_selected_faces.clear();
-                            g_selected_faces.push_back(tri);
-                            g_selected.clear();
-                            g_selected.push_back(g_indices[tri*3]);
-                            g_selected.push_back(g_indices[tri*3+1]);
-                            g_selected.push_back(g_indices[tri*3+2]);
-                            click_vertex = -4;
-                            update_mesh_buffers();
-                            update_gizmo_selection();
-                            printf("Selected face %d\n", tri);
+                            int face_id = -1;
+                            for (size_t i = 0; i < g_face_list.size(); i++) {
+                                for (int t : g_face_list[i].tri_indices) {
+                                    if (t == tri) {
+                                        face_id = (int)i;
+                                        break;
+                                    }
+                                }
+                                if (face_id != -1) break;
+                            }
+                            if (face_id != -1) {
+                                if (!ImGui::GetIO().KeyShift) g_selected_faces.clear();
+                                for (int t : g_face_list[face_id].tri_indices) {
+                                    g_selected_faces.push_back(t);
+                                }
+                                g_selected.clear();
+                                for (int t : g_selected_faces) {
+                                    g_selected.push_back((int)g_indices[t*3]);
+                                    g_selected.push_back((int)g_indices[t*3+1]);
+                                    g_selected.push_back((int)g_indices[t*3+2]);
+                                }
+                                std::sort(g_selected.begin(), g_selected.end());
+                                g_selected.erase(std::unique(g_selected.begin(), g_selected.end()), g_selected.end());
+
+                                update_mesh_buffers();
+                                update_gizmo_selection();
+                                printf("Selected face %d (%zu triangles)\n", face_id, g_face_list[face_id].tri_indices.size());
+                            }
                         } else {
-                            if (!ImGui::GetIO().KeyShift) g_selected_faces.clear();
-                            update_mesh_buffers();
-                            update_gizmo_selection();
+                            if (!ImGui::GetIO().KeyShift) {
+                                g_selected_faces.clear();
+                                update_mesh_buffers();
+                                update_gizmo_selection();
+                            }
                         }
                     }
                     click_mouse_pos = mouse_pos;
                     end_click_handler:;
                 }
 
-                // ---- Dragging ----
+                // ---- Dragging (gizmo / vertex) ----
                 if (gizmo_dragging && ImGui::IsMouseDown(0)) {
                     float delta_ndc_x = ndc_x - gizmo_prev_ndc_x;
                     float delta_ndc_y = ndc_y - gizmo_prev_ndc_y;
-                    
+
                     float projected_ndc = delta_ndc_x * gizmo_screen_dir[0] + delta_ndc_y * gizmo_screen_dir[1];
                     float world_delta = projected_ndc * gizmo_world_units_per_ndc;
-                    
+
                     if (fabs(world_delta) > 0.0001f && !g_gizmo_verts.empty()) {
                         if (!undo_pushed_for_gizmo) {
                             push_undo();
@@ -638,8 +713,8 @@ void RenderViewportWindow() {
                     gizmo_prev_ndc_y = ndc_y;
                 }
 
-                // Vertex drag
-                if (!gizmo_dragging && g_sel_mode == SELECT_VERTEX) {
+                // Vertex drag (skip entirely while knife is active)
+                if (!gizmo_dragging && !g_knife_active && g_sel_mode == SELECT_VERTEX) {
                     if (ImGui::IsMouseDown(0) && !ImGui::IsMouseClicked(0)) {
                         if (click_vertex != -1) {
                             float dx = mouse_pos.x - click_mouse_pos.x;
@@ -683,10 +758,13 @@ void RenderViewportWindow() {
                         g_gizmo_axis = -1;
                         undo_pushed_for_gizmo = false;
                         printf("Gizmo drag finished\n");
-                        goto skip_vertex_placement;
+                        goto end_mouse_release;
                     }
-                    
-                    if (g_sel_mode == SELECT_VERTEX) {
+
+                    // FIXED: guarded so releasing the mouse while placing a knife
+                    // point can no longer fall through and spawn a stray vertex
+                    // via the "no vertex hit -> add_vertex on ground" path.
+                    if (!g_knife_active && g_sel_mode == SELECT_VERTEX) {
                         if (!is_dragging) {
                             if (click_vertex != -1) {
                                 if (!ImGui::GetIO().KeyShift) g_selected.clear();
@@ -712,13 +790,36 @@ void RenderViewportWindow() {
                             }
                         }
                     }
-                    skip_vertex_placement:;
+                    end_mouse_release:;
                     click_vertex = -1;
                     is_dragging = false;
                     drag_vertex = -1;
+
+                    // ---- Draw Face: collect points ----
+                    if (g_draw_face_active && !gizmo_dragging && valid_ray && ImGui::IsMouseClicked(0)) {
+                        // Project the click onto the selected face's plane
+                        if (g_draw_face_face_idx >= 0 && g_draw_face_face_idx < (int)g_face_list.size()) {
+                            float nx, ny, nz, d;
+                            get_face_plane(g_draw_face_face_idx, nx, ny, nz, d);
+                            float denom = nx*direction[0] + ny*direction[1] + nz*direction[2];
+                            if (fabs(denom) > 1e-6f) {
+                                float t = -(nx*origin[0] + ny*origin[1] + nz*origin[2] + d) / denom;
+                                if (t > 0) {
+                                    std::array<float,3> hit = {origin[0] + t*direction[0],
+                                                               origin[1] + t*direction[1],
+                                                               origin[2] + t*direction[2]};
+                                    g_draw_face_points.push_back(hit);
+                                    printf("Point %zu: (%.3f, %.3f, %.3f)\n", g_draw_face_points.size(),
+                                           hit[0], hit[1], hit[2]);
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
     }
+
+end_viewport:
     ImGui::End();
 }

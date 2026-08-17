@@ -2,6 +2,7 @@
 #pragma once
 #include <vector>
 #include <utility>
+#include <array>    // for std::array
 
 // Mesh data
 extern std::vector<float> g_vertices;
@@ -53,3 +54,18 @@ extern int g_gizmo_axis;          // -1 = none, 0 = X, 1 = Y, 2 = Z
 extern float g_gizmo_pos[3];
 extern std::vector<int> g_gizmo_verts;
 extern float g_gizmo_size;
+
+struct MeshFace {
+    std::vector<int> tri_indices; // triangle indices in g_indices
+};
+extern std::vector<MeshFace> g_face_list;
+
+extern bool g_knife_active;
+extern int g_knife_stage;      // 0=idle, 1=first point set, 2=second point set
+extern float g_knife_start[3];
+extern float g_knife_end[3];
+
+// ---- Draw‑Face state ----
+extern bool g_draw_face_active;
+extern int g_draw_face_face_idx;        // face being cut
+extern std::vector<std::array<float,3>> g_draw_face_points;   // clicked points (3D)

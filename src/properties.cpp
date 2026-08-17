@@ -5,6 +5,7 @@
 #include "undo.h"   // <-- NEW
 #include <algorithm>
 #include "imgui/imgui.h"
+#include "viewport.h"
 
 void PropertiesWindow() {
     ImGuiViewport* main_vp = ImGui::GetMainViewport();
@@ -115,6 +116,16 @@ void PropertiesWindow() {
             detriangulate_selected();
         }
     }
+    ImGui::Text("Face Tools");
+    if (ImGui::Button("Make Face from Selected")) {
+        if (g_selected.size() >= 3) {
+            push_undo();
+            make_face_from_selected();
+            update_gizmo_selection();
+        } else {
+            printf("Select at least 3 vertices.\n");
+        }
+    }
 
     ImGui::Separator();
     ImGui::Text("Lighting");
@@ -125,9 +136,10 @@ void PropertiesWindow() {
     ImGui::Separator();
     ImGui::Text("Normals");
     if (ImGui::Button("Recalc Normals")) {
-        push_undo(); // Normal recalculation changes the mesh appearance
+        push_undo();
         compute_normals();
         update_mesh_buffers();
+        printf("Normals recalculated\n");
     }
     ImGui::SameLine();
     if (ImGui::Button("Flip Selected")) {
@@ -141,6 +153,12 @@ void PropertiesWindow() {
             update_mesh_buffers();
         }
     }
+    if (ImGui::Button("Unify Normals")) {
+        if (!g_indices.empty()) {
+            push_undo();
+            unify_normals();
+        }
+    }
 
     ImGui::Separator();
     ImGui::Text("Extrude");
@@ -151,5 +169,146 @@ void PropertiesWindow() {
         }
     }
 
-    ImGui::End();
+    if (ImGui::Button("Weld Vertices")) {
+        push_undo();
+        weld_vertices(0.001f);
+    }
+
+    ImGui::Text("Faces: %zu", g_face_list.size());
+    ImGui::Text("Triangles: %d", g_idx_count / 3);
+
+    // ---- Edge splitting ----
+    if (g_selected_edges.size() == 1) {
+        ImGui::Separator();
+        ImGui::Text("Selected Edge");
+        int v0 = g_selected_edges[0].first;
+        int v1 = g_selected_edges[0].second;
+        ImGui::Text("Vertices: (%d, %d)", v0, v1);
+
+        static float split_t = 0.5f;
+        ImGui::SliderFloat("Split Position", &split_t, 0.0f, 1.0f, "%.2f");
+
+        if (ImGui::Button("Split Edge")) {
+            if (v0 >= 0 && v1 >= 0 && v0 < g_vert_count && v1 < g_vert_count) {
+                push_undo();
+                split_edge(v0, v1, split_t);
+                // Clear the edge selection after split
+                g_selected_edges.clear();
+                g_selected.clear();
+                update_mesh_buffers();
+                update_gizmo_selection();
+            }
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Split at Midpoint")) {
+            split_t = 0.5f;
+            if (v0 >= 0 && v1 >= 0 && v0 < g_vert_count && v1 < g_vert_count) {
+                push_undo();
+                split_edge(v0, v1, 0.5f);
+                g_selected_edges.clear();
+                g_selected.clear();
+                update_mesh_buffers();
+                update_gizmo_selection();
+            }
+        }
+    }
+
+    ImGui::Separator();
+    ImGui::Text("Weld");
+
+    if (ImGui::Button("Weld by Distance")) {
+        if (!g_vertices.empty()) {
+            push_undo();
+            weld_vertices(0.001f, false, false);
+        }
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Weld to Center")) {
+        if (g_selected.size() >= 2) {
+            push_undo();
+            weld_vertices(0.0f, true, false);
+        }
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Weld to First")) {
+        if (g_selected.size() >= 2) {
+            push_undo();
+            weld_vertices(0.0f, false, true);
+        }
+    }
+
+    ImGui::Separator();
+    ImGui::Text("Knife Tool");
+    if (ImGui::Button(g_knife_active ? "Cancel Knife" : "Activate Knife")) {
+        g_knife_active = !g_knife_active;
+        if (g_knife_active) {
+            g_knife_stage = 0;
+            printf("Knife mode activated – click two points in viewport\n");
+        } else {
+            g_knife_stage = 0;
+        }
+    }
+    if (g_knife_active) {
+        ImGui::TextColored(ImVec4(1,1,0,1), "Click two points to define cut line.");
+        ImGui::Text("Stage: %s", g_knife_stage == 0 ? "first point" : "second point");
+    }
+
+    // ---- Face-specific tools ----
+    if (!g_selected_faces.empty()) {
+        ImGui::Separator();
+        ImGui::Text("Selected Faces: %zu", g_selected_faces.size());
+
+        if (g_selected_faces.size() == 1) {
+            int face_group_idx = -1;
+            for (size_t i = 0; i < g_face_list.size(); ++i) {
+                for (int tri : g_face_list[i].tri_indices) {
+                    if (tri == g_selected_faces[0]) {
+                        face_group_idx = (int)i;
+                        break;
+                    }
+                }
+                if (face_group_idx != -1) break;
+            }
+
+            if (face_group_idx != -1) {
+                // ---- Draw Face ----
+                if (ImGui::Button(g_draw_face_active ? "Cancel Draw Face" : "Draw Face")) {
+                    if (!g_draw_face_active) {
+                        g_draw_face_active = true;
+                        g_draw_face_face_idx = face_group_idx;
+                        g_draw_face_points.clear();
+                        printf("Draw Face mode activated – click points on the face, then press Finish.\n");
+                    } else {
+                        g_draw_face_active = false;
+                        g_draw_face_face_idx = -1;
+                        g_draw_face_points.clear();
+                    }
+                }
+                ImGui::SameLine();
+                if (g_draw_face_active) {
+                    ImGui::TextColored(ImVec4(1,1,0,1), "%zu points", g_draw_face_points.size());
+                    if (g_draw_face_points.size() >= 3) {
+                        if (ImGui::Button("Finish Draw Face")) {
+                            push_undo();
+                            split_face_by_polygon(face_group_idx, g_draw_face_points);
+                            g_draw_face_active = false;
+                            g_draw_face_face_idx = -1;
+                            g_draw_face_points.clear();
+                        }
+                        ImGui::SameLine();
+                        if (ImGui::Button("Clear Points")) {
+                            g_draw_face_points.clear();
+                        }
+                    } else {
+                        ImGui::Text("Need at least 3 points.");
+                    }
+                }
+
+                // ---- Also keep the old "Cut Face" line-split tool ----
+                // (optional)
+            }
+        }
+    }
+
+    ImGui::End();   
 }
